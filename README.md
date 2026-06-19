@@ -25,11 +25,11 @@ Each toggles on/off from the dashboard or the tray menu; state is saved to
 
 | Module | What it does | Default |
 |---|---|---|
-| **Quietlog** | Passive time journal — samples the foreground app every 5s (idle excluded) and shows a **Today / This week** breakdown per app. | on |
-| **Tabreaper** | Saves your window layout to 3 slots and restores it with one click — stop rebuilding your workspace on every context switch. | on |
+| **Quietlog** | Passive time journal — samples the foreground app every 5s (idle excluded), shows a **Today / This week** breakdown, and a **focus split** once you tag apps work / distraction / neutral (tap the dot on any row). | on |
+| **Tabreaper** | Saves your window layout to 3 slots and restores it with one click — repositions open windows **and relaunches apps that were closed**. | on |
 | **Anchor** | Detects compulsive window-flipping and fades in a calm full-screen overlay; click to continue. Low/medium/high sensitivity + 30-min snooze. | off |
 | **Localback** | Watches a folder and auto-versions every change (content-addressed dedup, keeps 25 newest per file). Restore any past version in-app. | off |
-| **Threadkeeper** | Records window titles (and, opt-in, clipboard text) into a local full-text index so you can search *"what did that error say an hour ago?"* | off |
+| **Threadkeeper** | Records window titles into a local full-text index so you can search *"what did that error say an hour ago?"* Optional extras: clipboard text, and full visible window text (UI Automation). | off |
 
 ---
 
@@ -125,16 +125,8 @@ round-trip + preserve, Anchor thresholds, and full-text search.
   start/stop, no thread leaks); loop bodies are exception-guarded so one bad cycle can't
   kill recording. SQLite uses WAL + a busy timeout for safe concurrent access.
 - **Safe writes.** `settings.json` / `scenes.json` are written atomically (temp + replace).
-- **Stack:** Python 3, `pywin32`, `pystray`, `Pillow`, `psutil`, `customtkinter`; SQLite,
-  ctypes, winreg, tkinter from the stdlib.
-
----
-
-## Not yet (possible v2)
-
-Tabreaper relaunching *closed* apps (currently repositions open ones); full
-visible-window-text capture for Threadkeeper (would add a dependency); per-app
-work/distraction tagging for Quietlog.
+- **Stack:** Python 3, `pywin32`, `pystray`, `Pillow`, `psutil`, `customtkinter`,
+  `uiautomation`; SQLite, ctypes, winreg, tkinter from the stdlib.
 
 ---
 
