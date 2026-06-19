@@ -47,7 +47,12 @@ python quietlog.py
 
 The tray icon sits bottom-right (maybe under the `^` chevron). It is **colored** while a
 recording module is active, **grey** when none are. Right-click it for the dashboard,
-quick actions, settings, help, and quit.
+quick actions, settings, help, and quit:
+
+<img src="docs/tray-menu.png" alt="Quietlog tray menu" width="280">
+
+The **Settings (enable / disable)** submenu toggles each module (and clipboard capture)
+without opening the dashboard.
 
 ---
 
