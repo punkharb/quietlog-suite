@@ -3,3 +3,4 @@ pystray
 Pillow
 psutil
 customtkinter
+uiautomation

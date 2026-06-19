@@ -51,6 +51,7 @@ BACKUP_MAX_MB = 20        # skip files bigger than this (don't snapshot huge blo
 BACKUP_KEEP = 25          # keep at most this many versions per file (prune oldest)
 THREAD_INTERVAL = 10      # Threadkeeper: seconds between captures
 RETAIN_DAYS = 90          # delete logged samples / recall older than this
+RECALL_MAX_ROWS = 50000   # hard cap on recall rows (full-text can grow fast)
 
 # Fonts: Win11-native faces (no bundling). Resolved at first GUI use against what's
 # actually installed, falling back to Segoe UI / Consolas on older Windows.
@@ -81,9 +82,11 @@ DEFAULT_SETTINGS = {
     "localback": False,    # opt-in: needs a folder chosen
     "threadkeeper": False,  # opt-in: records window titles
     "threadkeeper_clipboard": False,  # extra opt-in: also store copied text (may catch secrets)
+    "threadkeeper_fulltext": False,   # extra opt-in: capture visible window text (heavy; needs uiautomation)
     "localback_folder": "",
     "anchor_sensitivity": "medium",   # low | medium | high
     "anchor_snooze_until": 0,         # epoch secs; overlay suppressed until then
+    "app_tags": {},                   # exe -> "work" | "distraction" | "neutral"
 }
 
 
@@ -93,6 +96,17 @@ def prune_old(con, table, days=RETAIN_DAYS, now=None):
     cur = con.execute(f"DELETE FROM {table} WHERE ts < ?", (now - days * 86400,))
     con.commit()
     return cur.rowcount
+
+
+def cap_recall(con, max_rows=RECALL_MAX_ROWS):
+    """Keep only the newest `max_rows` recall rows (by rowid, robust to dup ts)."""
+    n = con.execute("SELECT COUNT(*) FROM recall").fetchone()[0]
+    if n > max_rows:
+        con.execute(
+            "DELETE FROM recall WHERE rowid NOT IN "
+            "(SELECT rowid FROM recall ORDER BY ts DESC, rowid DESC LIMIT ?)", (max_rows,))
+        con.commit()
+    return max(0, n - max_rows)
 
 
 def clear_table(table):
@@ -243,6 +257,28 @@ def _exe_for_pid(pid):
                     pass
 
 
+def _exe_path_for_pid(pid):
+    """Full exe path for a pid (for relaunch), or '' if unavailable."""
+    import win32process
+    try:
+        import psutil
+        return psutil.Process(pid).exe()
+    except Exception:
+        h = None
+        try:
+            h = win32process.OpenProcess(0x0410, False, pid)
+            return win32process.GetModuleFileNameEx(h, 0)
+        except Exception:
+            return ""
+        finally:
+            if h is not None:
+                try:
+                    import win32api
+                    win32api.CloseHandle(h)
+                except Exception:
+                    pass
+
+
 def get_active_app():
     import win32gui
     import win32process
@@ -266,6 +302,48 @@ def get_clipboard_text():
             win32clipboard.CloseClipboard()
     except Exception:
         return None
+
+
+_UIA_OK = None   # None=untried, True/False once we know if uiautomation imports
+
+
+def get_window_text(max_chars=4000):
+    """Visible text of the foreground window via UI Automation, or '' if unavailable.
+    Lazy-imports uiautomation; returns '' (never raises) if the dep is missing/slow."""
+    global _UIA_OK
+    if _UIA_OK is False:
+        return ""
+    try:
+        import uiautomation as auto
+        _UIA_OK = True
+        try:
+            auto.SetGlobalSearchTimeout(1.0)   # don't let a slow COM tree stall the recorder
+        except Exception:
+            pass
+        win = auto.GetForegroundControl()
+        if not win:
+            return ""
+        parts, seen = [], 0
+        # breadth-limited walk; bail early so we never stall the recorder thread
+        stack = [win]
+        steps = 0
+        while stack and seen < max_chars and steps < 400:
+            steps += 1
+            node = stack.pop()
+            try:
+                t = (node.Name or "").strip()
+                if t and len(t) > 1:
+                    parts.append(t)
+                    seen += len(t)
+                stack.extend(node.GetChildren())
+            except Exception:
+                continue
+        return " | ".join(dict.fromkeys(parts))[:max_chars]
+    except ImportError:
+        _UIA_OK = False
+        return ""
+    except Exception:
+        return ""
 
 
 # ===========================================================================
@@ -310,6 +388,16 @@ def aggregate_today(con, day=None, interval=SAMPLE_INTERVAL):
 def aggregate_week(con, now=None, interval=SAMPLE_INTERVAL):
     now = now if now is not None else int(time.time())
     return aggregate_range(con, now - 7 * 86400, now, interval)
+
+
+def focus_split(data, tags):
+    """Sum seconds per tag from [(app, secs)] using {exe: tag}. Untagged = neutral.
+    Returns {'work': s, 'distraction': s, 'neutral': s}. Pure logic."""
+    out = {"work": 0, "distraction": 0, "neutral": 0}
+    for app, secs in data:
+        tag = tags.get(app, "neutral")
+        out[tag if tag in out else "neutral"] += secs   # clamp stray/hand-edited tags
+    return out
 
 
 def fmt(seconds):
@@ -412,7 +500,7 @@ class Quietlog(BgModule):
 # MODULE 2: Tabreaper - save/restore window layouts
 # ===========================================================================
 def list_windows():
-    """[(hwnd, title, exe, (l,t,r,b)), ...] for real top-level windows."""
+    """[(hwnd, title, exe, rect, path), ...] for real top-level windows."""
     import win32gui
     import win32process
     out = []
@@ -431,9 +519,10 @@ def list_windows():
         try:
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
             exe = _exe_for_pid(pid)
+            path = _exe_path_for_pid(pid)
         except Exception:
-            exe = "(unknown)"
-        out.append((hwnd, title, exe, rect))
+            exe, path = "(unknown)", ""
+        out.append((hwnd, title, exe, rect, path))
 
     win32gui.EnumWindows(cb, None)
     return out
@@ -479,14 +568,25 @@ class Tabreaper:
         save_json(self.scenes, SCENES_PATH)
 
     def save_scene(self, slot):
-        wins = [{"title": t, "exe": e, "rect": list(r)} for _, t, e, r in list_windows()]
+        wins = [{"title": t, "exe": e, "rect": list(r), "path": p}
+                for _, t, e, r, p in list_windows()]
         self.scenes[str(slot)] = wins
         self._save()
         notify(f"Saved {len(wins)} windows to Slot {slot}.", "Tabreaper")
 
-    def restore_scene(self, slot):
+    def _place(self, hwnd, rect):
         import win32gui
         import win32con
+        l, t, r, b = rect
+        try:
+            if win32gui.IsIconic(hwnd) or win32gui.IsZoomed(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.MoveWindow(hwnd, l, t, r - l, b - t, True)
+            return True
+        except Exception:
+            return False
+
+    def restore_scene(self, slot):
         saved = self.scenes.get(str(slot))
         if not saved:
             notify(f"Slot {slot} is empty - save a layout there first.", "Tabreaper")
@@ -494,20 +594,41 @@ class Tabreaper:
         cands = list_windows()
         used = set()
         moved = 0
+        missing = []           # saved windows with no open match -> candidates to relaunch
         for w in saved:
             hwnd = match_window(w, [c for c in cands if c[0] not in used])
             if hwnd:
                 used.add(hwnd)
-                l, t, r, b = w["rect"]
-                try:
-                    # un-maximize / un-minimize first, else MoveWindow is ignored
-                    if win32gui.IsIconic(hwnd) or win32gui.IsZoomed(hwnd):
-                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                    win32gui.MoveWindow(hwnd, l, t, r - l, b - t, True)
+                if self._place(hwnd, w["rect"]):
                     moved += 1
-                except Exception:
-                    pass
-        notify(f"Restored {moved} of {len(saved)} windows from Slot {slot}.", "Tabreaper")
+            elif w.get("path") and os.path.exists(w["path"]):
+                missing.append(w)
+
+        relaunched = 0
+        for path in {w["path"] for w in missing}:   # dedup: one launch per exe
+            try:
+                os.startfile(path)          # launch closed app; reposition shortly after
+                relaunched += 1
+            except Exception:
+                pass
+        if missing:
+            # give apps a moment to open, then position the new windows
+            def reposition():
+                fresh = {c[0] for c in list_windows()} - {c[0] for c in cands}
+                later = list_windows()
+                seen = set()
+                for w in missing:
+                    hwnd = match_window(w, [c for c in later
+                                            if c[0] in fresh and c[0] not in seen])
+                    if hwnd:
+                        seen.add(hwnd)
+                        self._place(hwnd, w["rect"])
+            run_on_gui(lambda: _GUI_ROOT.after(2500, reposition))
+
+        msg = f"Restored {moved} of {len(saved)} windows from Slot {slot}."
+        if relaunched:
+            msg += f" Relaunched {relaunched} closed app(s)."
+        notify(msg, "Tabreaper")
 
     def menu_items(self, Item):
         import pystray
@@ -833,10 +954,16 @@ class Threadkeeper(BgModule):
     def _loop(self, stop):
         con = tk_connect()
         prune_old(con, "recall")           # trim history on startup
-        last_title, last_clip = None, None
+        cap_recall(con)
+        last_title, last_clip, last_text = None, None, None
+        cycles = 0
         try:
             while not stop.is_set():
                 try:
+                    cycles += 1
+                    if cycles % 360 == 0:          # ~hourly: re-trim while long-running
+                        prune_old(con, "recall")
+                        cap_recall(con)
                     if get_idle_seconds() < IDLE_THRESHOLD:
                         _, title = get_active_app()
                         if title and title != last_title:
@@ -850,6 +977,13 @@ class Threadkeeper(BgModule):
                                 last_clip = clip
                                 con.execute("INSERT INTO recall VALUES (?,?,?)",
                                             (clip, "clipboard", int(time.time())))
+                        # full window text is extra opt-in: heavy + reads everything on screen
+                        if SETTINGS.get("threadkeeper_fulltext"):
+                            text = get_window_text()
+                            if text and text != last_text:
+                                last_text = text
+                                con.execute("INSERT INTO recall VALUES (?,?,?)",
+                                            (text, "screen", int(time.time())))
                         con.commit()
                 except Exception as e:               # one bad cycle must not kill the thread
                     _dbg(f"threadkeeper loop error: {e!r}")
@@ -1100,6 +1234,9 @@ def open_dashboard():
             stats_box = ctk.CTkFrame(host, fg_color="transparent")
             stats_box.pack(fill="x", padx=16)
 
+            TAG_NEXT = {"neutral": "work", "work": "distraction", "distraction": "neutral"}
+            TAG_COLOR = {"work": "#5fd17e", "distraction": "#d9a85f", "neutral": "#5b6377"}
+
             def render_stats(_=None):
                 which = seg.get()
                 title_lbl.configure(text="This week" if which == "Week" else "Today")
@@ -1112,12 +1249,38 @@ def open_dashboard():
                     label(stats_box, "No activity logged yet - use your PC for a bit.").pack(anchor="w")
                     return
                 total = sum(s for _, s in data) or 1
-                # 3-column grid: name | bar (fills) | time -> aligned, no overflow
+                tags = SETTINGS.get("app_tags", {})
+
+                # focus summary line (tap a tag dot on a row to classify that app)
+                split = focus_split(data, tags)
+                stot = sum(split.values()) or 1
+                summary = (f"Focus: {split['work']/stot*100:.0f}% work  -  "
+                           f"{split['distraction']/stot*100:.0f}% distraction  -  "
+                           f"{split['neutral']/stot*100:.0f}% neutral")
+                label(stats_box, summary, size=11, bold=True).grid(
+                    row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+                # name(+tag toggle) | bar (fills) | time
                 stats_box.grid_columnconfigure(0, weight=0)
                 stats_box.grid_columnconfigure(1, weight=1)
                 stats_box.grid_columnconfigure(2, weight=0)
-                for i, (app, secs) in enumerate(data):
-                    label(stats_box, app[:24], size=11).grid(row=i, column=0, sticky="w", pady=2)
+                for i, (app, secs) in enumerate(data, start=1):
+                    tag = tags.get(app, "neutral")
+                    if tag not in TAG_COLOR:
+                        tag = "neutral"
+
+                    def cycle(a=app):
+                        t = SETTINGS.setdefault("app_tags", {})
+                        cur = t.get(a, "neutral")
+                        t[a] = TAG_NEXT.get(cur, "work")
+                        save_settings(SETTINGS)
+                        render_stats()
+                    dot = ctk.CTkButton(stats_box, text="●", width=22, height=22,
+                                        fg_color="transparent", hover_color="#1d2130",
+                                        text_color=TAG_COLOR[tag], font=(FONT_UI, 14),
+                                        command=cycle)
+                    dot.grid(row=i, column=0, sticky="w")
+                    label(stats_box, app[:22], size=11).grid(row=i, column=0, sticky="w", padx=(28, 0), pady=2)
                     bar = ctk.CTkProgressBar(stats_box)
                     bar.set(secs / total)
                     bar.grid(row=i, column=1, sticky="we", padx=10, pady=2)
@@ -1125,7 +1288,11 @@ def open_dashboard():
 
             seg.configure(command=render_stats)
             render_stats()
-            button(host, "Refresh", render_stats, w=90).pack(anchor="w", padx=16, pady=(8, 0))
+            row = ctk.CTkFrame(host, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=(8, 0))
+            button(row, "Refresh", render_stats, w=90).pack(side="left")
+            label(row, "tap the dot to tag an app  work / distraction / neutral",
+                  size=10).pack(side="left", padx=10)
 
             # modules
             label(host, "Modules", size=15, bold=True).pack(anchor="w", padx=16, pady=(16, 2))
@@ -1268,12 +1435,18 @@ def run_tray():
         SETTINGS["threadkeeper_clipboard"] = not SETTINGS.get("threadkeeper_clipboard")
         save_settings(SETTINGS)
 
+    def toggle_fulltext(icon, item):
+        SETTINGS["threadkeeper_fulltext"] = not SETTINGS.get("threadkeeper_fulltext")
+        save_settings(SETTINGS)
+
     settings_menu = Menu(
         *[Item(m.label, toggle_module(m), checked=lambda i, m=m: SETTINGS.get(m.name))
           for m in MODULES],
         Menu.SEPARATOR,
         Item("Threadkeeper: also save clipboard", toggle_clipboard,
              checked=lambda i: SETTINGS.get("threadkeeper_clipboard")),
+        Item("Threadkeeper: also save window text", toggle_fulltext,
+             checked=lambda i: SETTINGS.get("threadkeeper_fulltext")),
     )
 
     action_items = []
@@ -1369,6 +1542,21 @@ def selftest():
     assert match_window({"exe": "Code.exe", "title": "main.py - VS Code"}, cands) == 102
     assert match_window({"exe": "Code.exe", "title": "other.py - VS Code"}, cands) == 102  # prefix/exe
     assert match_window({"exe": "ghost.exe", "title": "x"}, cands) is None
+
+    # Quietlog focus_split: tags -> work/distraction/neutral seconds (untagged=neutral)
+    fs = focus_split([("Code.exe", 100), ("game.exe", 40), ("misc.exe", 10)],
+                     {"Code.exe": "work", "game.exe": "distraction"})
+    assert fs == {"work": 100, "distraction": 40, "neutral": 10}, fs
+    # stray/hand-edited tag clamps to neutral instead of raising
+    assert focus_split([("x", 5)], {"x": "bogus"}) == {"work": 0, "distraction": 0, "neutral": 5}
+
+    # cap_recall keeps only the newest N rows
+    rc = sqlite3.connect(":memory:")
+    rc.execute("CREATE TABLE recall (content TEXT, kind TEXT, ts INTEGER)")
+    rc.executemany("INSERT INTO recall VALUES ('x','screen',?)", [(i,) for i in range(120)])
+    cap_recall(rc, max_rows=50)
+    assert rc.execute("SELECT COUNT(*) FROM recall").fetchone()[0] == 50
+    assert rc.execute("SELECT MIN(ts) FROM recall").fetchone()[0] == 70   # oldest 70 dropped
 
     # Localback version_name: readable date + hash, keeps the 8-char hash for dedup
     vn = version_name(1700000000, "abcdef0123456789", ".txt")
