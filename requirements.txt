@@ -1,0 +1,5 @@
+pywin32
+pystray
+Pillow
+psutil
+customtkinter

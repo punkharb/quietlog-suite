@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller build output (the exe ships via GitHub Releases, not git)
+build/
+dist/
+*.spec
+
+# local scratch
+*.tmp
